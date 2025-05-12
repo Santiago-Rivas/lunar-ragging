@@ -1,0 +1,183 @@
+id;name;category
+1;Aanchal Malhotra;business
+2;Abdallah Abouelenein;tech
+3;Abigail Johnson;business
+4;Agnes Gund;business
+5;Ai Tong;tech
+6;Ai Weiwei;actor
+7;Alan Lightman;tech
+8;Alex Honnold;football
+9;Alina Morse;business
+10;Alison Bechdel;actor
+11;Amanda Gorman;actor
+12;Amitabh Kant;tech
+13;Andre Fenton;tech
+14;Andrei Linde;tech
+15;Anshu Gupta;business
+16;Arthur Zang;tech
+17;Arunachalam Muruganantham;tech
+18;Aryan Mishra;tech
+19;Audrey Tang;tech
+20;Autumn Peltier;business
+21;Bad Bunny;singer
+22;Bayo Akomolafe;business
+23;Ben Goertzel;tech
+24;Bethlehem Tilahun Alemu;business
+25;Boyan Slat;tech
+26;Brené Brown;actor
+27;Bret Victor;tech
+28;Brian Armstrong;tech
+29;Bruno Giussani;business
+30;Bryan Johnson;business
+31;Bryan Stevenson;business
+32;Cardinal Peter Turkson;business
+33;Carlo Rovelli;tech
+34;Chimamanda Ngozi Adichie;actor
+35;Chloe Kim;football
+36;Chris Sacca;business
+37;Christiana Figueres;business
+38;Christine Gulbranson;tech
+39;Dalai Lama;business
+40;David Attenborough;tech
+41;David Deutsch;tech
+42;Devin Oliver;tech
+43;Diana Beresford-Kroeger;tech
+44;Diébédo Francis Kéré;tech
+45;Donald Glover;actor
+46;Dr. Peng Zhao;business
+47;Dylan Field;tech
+48;E.O. Wilson;tech
+49;Eliud Kipchoge;football
+50;Emily Pilloton-Lam;tech
+51;Emmanuelle Charpentier;tech
+52;Esther Lafferty;tech
+53;FKA Twigs;singer
+54;Fei-Fei Li;tech
+55;Feng Zhang;tech
+56;Fionn Ferreira;tech
+57;Florence Welch;singer
+58;Gitanjali Rao;tech
+59;Guadalupe Hernandez;business
+60;Gwynne Shotwell;tech
+61;Haile Gebrselassie;football
+62;Hamdi Ulukaya;business
+63;Hans Rosling;tech
+64;Hindou Oumarou Ibrahim;tech
+65;Hjalmar Nilsonne;tech
+66;Hla Hla Win;business
+67;Hugh Herr;tech
+68;Iddris Sandu;tech
+69;Iris van Herpen;tech
+70;Isha Datar;tech
+71;Jacob Collier;singer
+72;Jacqueline Novogratz;business
+73;James "Radio" Kennedy;business
+74;James Tour;tech
+75;Jane Goodall;business
+76;Jane Ni Dhulchaointigh;tech
+77;Janelle Monáe;singer
+78;Jeff Bezos;business
+79;Jennifer Doudna;tech
+80;Jensen Huang;tech
+81;Jessica Mathews;tech
+82;Jiro Ono;business
+83;John Carmack;tech
+84;John Goodenough;tech
+85;Jon Batiste;singer
+86;Jon Stokes;business
+87;Jon Waterhouse;tech
+88;Jonathan Haidt;business
+89;Jony Ive;tech
+90;Jordan Rancie;tech
+91;José Andrés;business
+92;Joy Buolamwini;tech
+93;Kai-Fu Lee;tech
+94;Katalin Karikó;tech
+95;Kate Raworth;business
+96;Katherine Hayhoe;tech
+97;Katie Bouman;tech
+98;Kevin Abstract;singer
+99;Kiran Mazumdar-Shaw;business
+100;Kizzmekia Corbett;tech
+101;Laurene Powell Jobs;business
+102;LeBron James;football
+103;Leah Thomas;business
+104;Leonor Caraballo;business
+105;Limor Fried;tech
+106;Lin-Manuel Miranda;singer
+107;Linda Rothenberg;business
+108;Lionel Messi;football
+109;Liu Zihong;tech
+110;Lizzo;singer
+111;Luang Por Dhammajayo;business
+112;Luis von Ahn;tech
+113;MacKenzie Scott;business
+114;Marc Andreessen;business
+115;Marcus Rashford;football
+116;Maria Popova;business
+117;Marian Croak;tech
+118;Marina Gorbis;business
+119;Mark Cuban;business
+120;Mark Rober;tech
+121;Mary Robinson;business
+122;May Mahboob;tech
+123;Melanie Perkins;tech
+124;Memory Banda;business
+125;Michaela Coel;actor
+126;Michelle Alexander;business
+127;Michelle Simmons;tech
+128;Mike Cannon-Brookes;business
+129;Mohammed Ibrahim;business
+130;Muhammad Yunus;business
+131;Nandan Nilekani;tech
+132;Naomi Osaka;tennis
+133;Nemonte Nenquimo;tech
+134;Neri Oxman;tech
+135;Nonny de la Peña;tech
+136;Oprah Winfrey;actor
+137;Palmer Luckey;tech
+138;Pardis Sabeti;tech
+139;Paul McCartney;singer
+140;Peter Attia;tech
+141;Phoebe Waller-Bridge;actor
+142;Ray Dalio;business
+143;Reid Hoffman;business
+144;Reshma Saujani;business
+145;Richard Branson;business
+146;Riz Ahmed;actor
+147;Robert Jackson;business
+148;Robin Wall Kimmerer;business
+149;Ryan Hickman;business
+150;Ryan Reynolds;actor
+151;Sal Khan;tech
+152;Sam Altman;tech
+153;Samaira Mehta;tech
+154;Sara Seager;tech
+155;Sarah Friar;business
+156;Sebastião Salgado;tech
+157;Serena Williams;tennis
+158;Shohei Ohtani;football
+159;Simone Biles;football
+160;Simone Giertz;tech
+161;Sonam Wangchuk;tech
+162;Stephen Curry;football
+163;Strive Masiyiwa;business
+164;Sulak Sivaraksa;business
+165;Taika Waititi;actor
+166;Tarana Burke;business
+167;Thomas Heatherwick;tech
+168;Tim Berners-Lee;tech
+169;Tobias Lütke;tech
+170;Tony Xu;business
+171;Tyler Cowen;business
+172;Tyler Perry;actor
+173;Vandana Shiva;business
+174;Vinod Khosla;business
+175;Vitalik Buterin;tech
+176;Wei Fei;business
+177;William Kamkwamba;tech
+178;Xóchitl Guadalupe Cruz López;tech
+179;Yo-Yo Ma;singer
+180;Yuval Noah Harari;actor
+181;Zaila Avant-garde;tech
+182;Ziauddin Sardar;business
