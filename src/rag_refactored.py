@@ -16,6 +16,8 @@ import os
 import re
 import textwrap
 import uuid
+import csv
+from dotenv import load_dotenv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Protocol, Sequence
@@ -36,6 +38,7 @@ CHUNK_OVERLAP = 128
 PERSIST_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
 COLLECTION_NAME = "participants"
 
+load_dotenv()
 
 # ---------- dataclasses -----------------------------------------------------
 class BaseDoc(Protocol):
@@ -50,6 +53,7 @@ class DossierDoc:
     user_id: str
     event_id: str
     text: str
+    name: str = ""
     source: str = "dossier"
 
 
@@ -58,6 +62,7 @@ class HTMLResearchDoc:
     user_id: str
     event_id: str
     html_path: Path
+    name: str = ""
     source: str = "html"
 
     @property
@@ -84,23 +89,40 @@ class ConvSummaryDoc:
 class ConnectionRAG:
     def __init__(self, persist_directory: str = PERSIST_DIR):
         self.client = chromadb.PersistentClient(path=persist_directory)
-        self.embedding_fn = OpenAIEmbeddings(model=EMBED_MODEL).embed_documents
+
+        # 1️⃣  keep the full object, not the method
+        self.embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
+
+        # 2️⃣  hand that object to Chroma
         self.collection = self._get_collection()
+
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP, separators=["\n\n", "\n", " "]
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", " "],
         )
 
     def _get_collection(self) -> Chroma:
         try:
-            return Chroma(client=self.client, collection_name=COLLECTION_NAME, embedding_function=self.embedding_fn)
+            return Chroma(
+                client=self.client,
+                collection_name=COLLECTION_NAME,
+                embedding_function=self.embeddings,   # ← object with both methods
+            )
         except ValueError:
-            return Chroma.from_documents([], self.embedding_fn, client=self.client, collection_name=COLLECTION_NAME)
+            return Chroma.from_documents(
+                [],
+                self.embeddings,
+                client=self.client,
+                collection_name=COLLECTION_NAME,
+            )
 
     # ---- ingestion ---------------------------------------------------------
     def add_documents(self, docs: Sequence[BaseDoc]):
         ids: list[str] = []
         texts: list[str] = []
         metas: list[dict] = []
+
         for doc in docs:
             for chunk in self.splitter.split_text(doc.text):
                 ids.append(str(uuid.uuid4()))
@@ -110,38 +132,80 @@ class ConnectionRAG:
                         "user_id": doc.user_id,
                         "event_id": doc.event_id,
                         "source": doc.source,
+                        "name": getattr(doc, "name", ""),
+                        "dossier": getattr(doc, "text", "")
                     }
                 )
+
         if texts:
-            self.collection.add(ids=ids, documents=texts, metadatas=metas)
-            logging.info("Added %d chunks (docs=%d) to collection", len(texts), len(set(m.user_id for m in metas)))
+            self.collection.add_texts(texts, ids=ids, metadatas=metas)
+            logging.info(
+                "Added %d chunks (docs=%d) to collection",
+                len(texts),
+                len({m['user_id'] for m in metas}),
+            )
         else:
             logging.warning("No texts to index!")
 
     # ---- retrieval & suggestion -------------------------------------------
     def suggest_connections(self, user_id: str, event_id: str, k: int = 5) -> list[dict]:
-        where_filter = {"event_id": {"$eq": event_id}, "user_id": {"$ne": user_id}}
-        retriever = self.collection.as_retriever(search_type="mmr", search_kwargs={"k": 20, "filter": where_filter})
-        docs = retriever.get_relevant_documents("MATCHING_QUERY_PLACEHOLDER")  # query text not used for MMR
-        context = "\n---\n".join(d.page_content.strip() for d in docs[:10])
-        prompt = self._build_prompt(user_id, context, k)
-        logging.debug("Prompt:\n%s", prompt)
-        response = self._ask_llm(prompt)
-        return response
+        # combine the two predicates under a single $and operator
+        where_filter = {
+            "$and": [
+                {"event_id": {"$eq": event_id}},
+                {"user_id":  {"$ne": user_id}},
+            ]
+        }
+
+        retriever = self.collection.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": 20, "filter": where_filter},
+        )
+
+        target_user = self._lookup_user(user_id)
+        target_name = ""
+        target_dossier = ""
+        if target_user["metadatas"]:
+            target_name = target_user["metadatas"][0].get("name", "")
+            target_dossier = target_user["metadatas"][0].get("dossier", "")
+        docs = retriever.invoke(target_dossier)
+
+        parts = []
+        for d in docs[:10]:
+            parts.append(
+                {
+                    "user_id": d.metadata["user_id"],
+                    "name":    d.metadata.get("name", ""),
+                    "chunk":   d.page_content.strip(),
+                }
+            )
+
+        prompt = self._build_prompt(user_id, target_name, target_dossier, parts, k)
+        logging.info("Prompt:\n%s", prompt)
+        return self._ask_llm(prompt)
 
     # ---- helpers -----------------------------------------------------------
     @staticmethod
-    def _build_prompt(user_id: str, context: str, k: int) -> str:
+    def _build_prompt(
+        user_id: str,
+        user_name: str,
+        user_dossier: str,
+        context_items: list[dict],
+        k: int,
+    ) -> str:
         return textwrap.dedent(
             f"""
-            You are an expert networking assistant.
-            Given the following context chunks about other participants in the same event, return a JSON list of the top {k} people that should match with user '{user_id}'.
+You are an expert networking assistant.
+Given the following context chunks about other participants in the same event, return a JSON list of the top {k} people that should match with user '{user_id}' ({user_name}).
 
-            Each item must be an object {{"user_id": str, "reason": str}}.
-            Only output valid JSON without markdown fences.
+This is the dossier of {user_id}:
+{user_dossier}
 
-            Context:
-            {context}
+Each item must be an object {{"user_id": str, "reason": str}}.
+Only output valid JSON without markdown fences.
+
+Context (JSON):
+{json.dumps(context_items, ensure_ascii=False, indent=2)}
             """
         )
 
@@ -165,20 +229,63 @@ class ConnectionRAG:
         # fallback
         return [{"raw_output": content}]
 
+    def _lookup_user(self, user_id: str) -> str:
+        """Return the name stored in Chroma metadata for this user_id (or '')."""
+        try:
+            return self.collection.get(
+                where={"user_id": {"$eq": user_id}},
+                limit=1,
+            )
+        except Exception:
+            pass
+        return {}
+
 
 # ---------- CLI ------------------------------------------------------------
 
 def ingest_from_dirs(rag: ConnectionRAG, dossier_dir: Path, html_dir: Path, event_id: str):
     docs: list[BaseDoc] = []
+    name_map = _load_name_map(dossier_dir)
+
     for dossier_file in dossier_dir.glob("*.md"):
         user_id = dossier_file.stem
         text = dossier_file.read_text(encoding="utf-8")
-        docs.append(DossierDoc(user_id=user_id, event_id=event_id, text=text))
+        docs.append(
+            DossierDoc(
+                user_id=user_id,
+                event_id=event_id,
+                text=text,
+                name=name_map.get(user_id, ""),     # ← new field
+            )
+        )
         html_path = html_dir / f"{user_id}.html"
         if html_path.exists():
-            docs.append(HTMLResearchDoc(user_id=user_id, event_id=event_id, html_path=html_path))
+            docs.append(
+                HTMLResearchDoc(
+                    user_id=user_id,
+                    event_id=event_id,
+                    html_path=html_path,
+                    name=name_map.get(user_id, ""),
+                )
+            )
     rag.add_documents(docs)
 
+
+def _load_name_map(dossier_dir: Path) -> dict[str, str]:
+    """
+    Expects a file  <dossier_dir>/id_to_name.csv  with header  id;name
+    Returns { "1": "Lionel Messi", "2": "Ada Lovelace", … }.
+    """
+    csv_path = dossier_dir / "id_to_name.csv"
+    name_map: dict[str, str] = {}
+    if not csv_path.exists():
+        logging.warning("Missing id_to_name.csv - names will be empty")
+        return name_map
+
+    with csv_path.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh, delimiter=";"):
+            name_map[row["id"]] = row["name"]
+    return name_map
 
 def main():
     parser = argparse.ArgumentParser(description="Connection RAG CLI")
