@@ -87,12 +87,14 @@ class ConvSummaryDoc:
 
 # ---------- RAG core --------------------------------------------------------
 class ConnectionRAG:
-    def __init__(self, persist_directory: str = PERSIST_DIR):
+    def __init__(self, persist_directory: str = PERSIST_DIR, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP):
         self.client = chromadb.PersistentClient(path=persist_directory)
 
         # 1️⃣  keep the full object, not the method
         self.embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
 
+        # modelo de chat (antes era global)
+        self.CHAT_MODEL = CHAT_MODEL
         # 2️⃣  hand that object to Chroma
         self.collection = self._get_collection()
 
@@ -183,7 +185,15 @@ class ConnectionRAG:
         prompt = self._build_prompt(user_id, target_name, target_dossier, parts, k)
         logging.info("Prompt:\n%s", prompt)
         return self._ask_llm(prompt)
-
+    def build_prompt(
+        self,
+        user_id: str,
+        user_name: str,
+        user_dossier: str,
+        context_items: list[dict],
+        k: int,
+    ) -> str:
+        return self._build_prompt(user_id, user_name, user_dossier, context_items, k)
     # ---- helpers -----------------------------------------------------------
     @staticmethod
     def _build_prompt(
@@ -208,6 +218,9 @@ Context (JSON):
 {json.dumps(context_items, ensure_ascii=False, indent=2)}
             """
         )
+
+    def ask_llm(self, prompt: str) -> list[dict]:
+        return self._ask_llm(prompt)
 
     def _ask_llm(self, prompt: str) -> list[dict]:
         client = openai.OpenAI()
