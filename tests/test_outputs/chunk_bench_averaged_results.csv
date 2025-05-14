@@ -1,0 +1,5 @@
+chunk_size,chunk_overlap,k_retriever,mmr_lambda,temperature,num_chunks,indexing_sec,throughput_cps,mem_before_idx,mem_after_idx,mem_before_q,mem_after_q,p95_latency_ms,redundancy,diversity,faithfulness,context_precision,targets_tested
+1024,128,20,0.8,0.7,2023.0,97.49,0.0,717.3,874.7,1403.471,1408.224,5040.331,0.0,0.578,0.27,0.0,494
+1024,256,20,0.8,0.7,2023.0,97.73,0.0,716.8,867.6,1410.038,1415.029,4956.854,0.0,0.578,0.265,0.0,494
+2048,128,20,0.8,0.7,2023.0,97.56,0.0,717.0,874.0,1409.723,1414.389,4907.687,0.0,0.578,0.295,0.0,494
+2048,256,20,0.8,0.7,2023.0,96.54,0.0,717.4,877.6,1465.37,1471.218,5014.205,0.0,0.578,0.301,0.0,494

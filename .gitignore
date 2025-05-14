@@ -176,3 +176,5 @@ cython_debug/
 chroma_db
 *.swp
 *.swo
+*.bak
+tests/cache

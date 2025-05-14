@@ -2,7 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # Carga de datos (asegúrate de haber generado 'chunk_bench_extended.csv')
-df = pd.read_csv("chunk_bench_extended.csv")
+df = pd.read_csv("20250514_102624-chunk_bench_parallel_grid_search.csv")
 
 # -----------------------------
 # 1) Impacto de chunk_size en el tiempo de indexación

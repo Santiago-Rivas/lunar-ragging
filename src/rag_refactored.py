@@ -25,13 +25,13 @@ from typing import List, Protocol, Sequence
 import chromadb
 import openai
 from bs4 import BeautifulSoup
-from langchain.embeddings import OpenAIEmbeddings
+from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Chroma
 
 # ---------- configuration --------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "paraphrase-MiniLM-L3-v2")
 CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 CHUNK_SIZE = 1024
 CHUNK_OVERLAP = 128
@@ -90,8 +90,11 @@ class ConnectionRAG:
     def __init__(self, persist_directory: str = PERSIST_DIR, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP):
         self.client = chromadb.PersistentClient(path=persist_directory)
 
-        # 1️⃣  keep the full object, not the method
-        self.embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
+        # Using HuggingFace embeddings instead of OpenAI
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=EMBED_MODEL,
+            model_kwargs={'device': 'cpu'}
+        )
 
         # modelo de chat (antes era global)
         self.CHAT_MODEL = CHAT_MODEL
@@ -261,6 +264,7 @@ def ingest_from_dirs(rag: ConnectionRAG, dossier_dir: Path, html_dir: Path, even
     name_map = _load_name_map(dossier_dir)
 
     for dossier_file in dossier_dir.glob("*.md"):
+        print("dossier_file: " + str(dossier_file)[:50] + ("..." if len(str(dossier_file)) > 50 else ""))
         user_id = dossier_file.stem
         text = dossier_file.read_text(encoding="utf-8")
         docs.append(
@@ -289,7 +293,7 @@ def _load_name_map(dossier_dir: Path) -> dict[str, str]:
     Expects a file  <dossier_dir>/id_to_name.csv  with header  id;name
     Returns { "1": "Lionel Messi", "2": "Ada Lovelace", … }.
     """
-    csv_path = dossier_dir / "id_to_name.csv"
+    csv_path = dossier_dir / "users.csv"
     name_map: dict[str, str] = {}
     if not csv_path.exists():
         logging.warning("Missing id_to_name.csv - names will be empty")
