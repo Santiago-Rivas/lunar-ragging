@@ -24,10 +24,10 @@ from src.rag_refactored import ConnectionRAG, ingest_from_dirs
 
 DATA_DOSSIER = Path(__file__).parent.parent / "data/space_data/dossiers"
 DATA_HTML    = Path(__file__).parent.parent / "data/space_data/html"
-EVENT_ID     = "moon_event"
-OUTPUT_FILE  = Path(__file__).parent / f"{time.strftime('%Y%m%d_%H%M%S')}-chunk_bench_parallel_grid_search.csv"
+EVENT_ID     = "F"
+OUTPUT_FILE  = Path(__file__).parent / f"chunk_bench_parallel_grid_search.csv"
 WORKERS      = 5
-MAX_USERS    = None
+MAX_USERS    = 2
 # Maximum number of concurrent users to process per parameter combination
 MAX_USER_THREADS = 10
 
@@ -35,17 +35,17 @@ DIVERSITY_K   = 10
 faith_metric  = Faithfulness()
 
 # grid of parameters to sweep
-chunk_sizes    = [1024, 2048]
-chunk_overlaps = [64, 128]
-k_retriever_ls = [5, 10, 20]
-mmr_lambdas    = [0.2, 0.5, 0.8]
-temperatures   = [0.0, 0.2, 0.7]
+# chunk_sizes    = [512, 1024, 2048, 4096]
+# chunk_overlaps = [64, 128, 256]
+# k_retriever_ls = [5, 10, 20]
+# mmr_lambdas    = [0.0, 0.3, 0.5, 0.7]
+# temperatures   = [0.0, 0.2, 0.5]
 
-# chunk_sizes    = [1024, 2048]
-# chunk_overlaps = [128, 256]
-# k_retriever_ls = [20]
-# mmr_lambdas    = [0.8]
-# temperatures   = [0.7]
+chunk_sizes    = [1024]
+chunk_overlaps = [128]
+k_retriever_ls = [20]
+mmr_lambdas    = [0.8]
+temperatures   = [0.7]
 
 # Lock for thread-safe CSV writing
 csv_lock = threading.Lock()
@@ -106,26 +106,25 @@ def process_single_target(target_id, rag, params, n_chunks, idx_time, mem_before
     # querying & collect
     mem_before_q = proc.memory_info().rss / 1024**2
     latencies, raw_answer, all_docs = [], None, None
-    for i in range(1):
-        docs = retriever.invoke(target_dossier)
-        if i==0: all_docs = docs
+    docs = retriever.invoke(target_dossier)
+    all_docs = docs
 
-        parts = [{"user_id":d.metadata["user_id"],
-                  "name":   d.metadata.get("name",""),
-                  "chunk":  d.page_content}
-                 for d in docs[:10]]
-        prompt = rag.build_prompt(target_id, target_name, target_dossier, parts, k=5)
+    parts = [{"user_id":d.metadata["user_id"],
+              "name":   d.metadata.get("name",""),
+              "chunk":  d.page_content}
+             for d in docs[:10]]
+    prompt = rag.build_prompt(target_id, target_name, target_dossier, parts, k=5)
 
-        t1 = time.perf_counter()
-        resp = openai.OpenAI().chat.completions.create(
-            model=rag.CHAT_MODEL,
-            temperature=temperature,
-            messages=[{"role":"user","content":prompt}],
-        )
-        text = resp.choices[0].message.content.strip()
-        latencies.append(time.perf_counter() - t1)
-        if raw_answer is None:
-            raw_answer = text
+    t1 = time.perf_counter()
+    resp = openai.OpenAI().chat.completions.create(
+        model=rag.CHAT_MODEL,
+        temperature=temperature,
+        messages=[{"role":"user","content":prompt}],
+    )
+    text = resp.choices[0].message.content.strip()
+    latencies.append(time.perf_counter() - t1)
+    if raw_answer is None:
+        raw_answer = text
     mem_after_q = proc.memory_info().rss / 1024**2
 
     # redundancy & diversity
@@ -144,7 +143,7 @@ def process_single_target(target_id, rag, params, n_chunks, idx_time, mem_before
 
     # faithfulness
     sample = {
-        "question": [f"Suggest matches for user {target_id}"],
+        "question": [prompt],
         "answer":   [raw_answer],
         "contexts": [[d.page_content for d in all_docs[:10]]],
     }
@@ -159,9 +158,6 @@ def process_single_target(target_id, rag, params, n_chunks, idx_time, mem_before
     TH = 0.75
     ctx_prec = sum(1 for s in sims_q if s>=TH)/len(sims_q) if sims_q.size else 0
 
-    # p95 latency
-    p95 = round(1000*sorted(latencies)[int(0.95*len(latencies))],1)
-
     record = {
         "target_id":       target_id,
         "chunk_size":      ch_size,
@@ -171,12 +167,10 @@ def process_single_target(target_id, rag, params, n_chunks, idx_time, mem_before
         "temperature":     temperature,
         "num_chunks":      n_chunks,
         "indexing_sec":    round(idx_time,2),
-        "throughput_cps":  round(throughput,1) if 'throughput' in locals() else 0,
         "mem_before_idx":  round(mem_before_idx,1),
         "mem_after_idx":   round(mem_after_idx,1),
         "mem_before_q":    round(mem_before_q,1),
         "mem_after_q":     round(mem_after_q,1),
-        "p95_latency_ms":  p95,
         "redundancy":      round(redundancy,3),
         "diversity":       round(diversity,3),
         "faithfulness":    round(faith_score,3),
