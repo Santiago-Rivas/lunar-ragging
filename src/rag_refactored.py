@@ -6,6 +6,7 @@ How to use (quick):
 $ python rag_refactored.py index --dossier_dir data/dossiers --html_dir data/html  # ingest
 $ python rag_refactored.py suggest --user_id lionel_messi --event_id moon_event   # get matches
 $ python rag_refactored.py suggest --user_id lionel_messi --event_id moon_event --evaluate  # get matches with faithfulness evaluation
+$ python rag_refactored.py test --config tests/config.json  # run tests with multiple configurations
 """
 
 from __future__ import annotations
@@ -18,10 +19,12 @@ import re
 import textwrap
 import uuid
 import csv
+import time
+import concurrent.futures
 from dotenv import load_dotenv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Protocol, Sequence
+from typing import List, Protocol, Sequence, Dict, Any, Tuple, Iterator
 
 import chromadb
 import openai
@@ -88,6 +91,10 @@ class ConvSummaryDoc:
     text: str
     source: str = "conv"
 
+shared_embeddings = HuggingFaceEmbeddings(
+    model_name=EMBED_MODEL,
+    model_kwargs={'device': 'cpu'}
+)
 
 # ---------- RAG core --------------------------------------------------------
 class ConnectionRAG:
@@ -100,10 +107,7 @@ class ConnectionRAG:
         self.client = chromadb.PersistentClient(path=str(self.persist_directory))
 
         # Using HuggingFace embeddings instead of OpenAI
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=EMBED_MODEL,
-            model_kwargs={'device': 'cpu'}
-        )
+        self.embeddings = shared_embeddings
 
         # modelo de chat (antes era global)
         self.CHAT_MODEL = CHAT_MODEL
@@ -358,6 +362,134 @@ def _load_name_map(dossier_dir: Path) -> dict[str, str]:
             name_map[row["id"]] = row["name"]
     return name_map
 
+# ---------- Test functionality --------------------------------------------
+
+def generate_config_combinations(config: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    """Generate all combinations of configuration parameters."""
+    # Extract lists of values for each parameter
+    keys = list(config.keys())
+    value_lists = [config[key] if isinstance(config[key], list) else [config[key]] for key in keys]
+    
+    # Generate all combinations
+    import itertools
+    for values in itertools.product(*value_lists):
+        yield {keys[i]: values[i] for i in range(len(keys))}
+
+def get_config_hash(config: Dict[str, Any]) -> str:
+    """Generate a hash string for a configuration."""
+    # For simplicity, we'll just use chunk_size and chunk_overlap for the directory name
+    return f"cs{config.get('chunk_size', DEFAULT_CHUNK_SIZE)}_co{config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP)}"
+
+def ensure_chroma_db_exists(config: Dict[str, Any], dossier_dir: Path, html_dir: Path) -> None:
+    """Check if a Chroma DB for this config exists, if not, create it."""
+    config_hash = get_config_hash(config)
+    db_path = Path(CHROMA_BASE_DIR) / config_hash
+    
+    if not db_path.exists():
+        logging.info(f"Creating new Chroma DB for config: {config_hash}")
+        rag = ConnectionRAG(
+            chunk_size=config.get('chunk_size', DEFAULT_CHUNK_SIZE),
+            chunk_overlap=config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP)
+        )
+        ingest_from_dirs(rag, dossier_dir, html_dir, config.get('event_id', 'moon_event'))
+    else:
+        logging.info(f"Chroma DB already exists for config: {config_hash}")
+
+def process_users(config: Dict[str, Any], user_ids: List[str], output_csv: Path, max_workers: int = None, runs_per_test: int = 3) -> None:
+    """Process multiple users with a single Chroma DB instance and write results to CSV."""
+    # Initialize ConnectionRAG only once for all users with this config
+    rag = ConnectionRAG(
+        chunk_size=config.get('chunk_size', DEFAULT_CHUNK_SIZE),
+        chunk_overlap=config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP)
+    )
+    
+    k = config.get('k', 5)
+    event_id = config.get('event_id', 'moon_event')
+    config_hash = get_config_hash(config)
+    
+    logging.info(f"Processing {len(user_ids)} users with config {config_hash}, {runs_per_test} runs per user")
+    
+    def process_single_user(user_id: str, run_number: int) -> None:
+        """Inner function to process a single user and write results to CSV."""
+        try:
+            # Get suggestions with faithfulness evaluation
+            result = rag.suggest_connections(user_id, event_id, k, evaluate_faith=True)
+            user_result = result.get(user_id, {})
+            
+            # Write results to CSV
+            with output_csv.open('a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                
+                # Form a row: first all config params, then user_id, run number, faith score, and serialized suggestions
+                row = [
+                    config.get('chunk_size', DEFAULT_CHUNK_SIZE),
+                    config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP),
+                    config.get('event_id', 'moon_event'),
+                    config.get('k', 5),
+                    user_id,
+                    run_number,
+                    user_result.get('faithfulness_score', 0.0),
+                    json.dumps(user_result.get('suggestions', []), ensure_ascii=False)
+                ]
+                
+                writer.writerow(row)
+                logging.info(f"Results for user {user_id} run {run_number} with config {config_hash} written to CSV")
+        except Exception as e:
+            logging.error(f"Error processing user {user_id} run {run_number} with config {config_hash}: {e}")
+    
+    # Generate all user-run pairs
+    tasks = []
+    for user_id in user_ids:
+        for run in range(1, runs_per_test + 1):
+            tasks.append((user_id, run))
+    
+    # Process user-run pairs in parallel using threads
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_single_user, user_id, run) for user_id, run in tasks]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Unexpected error in thread: {e}")
+
+def run_tests(config_file: Path, output_csv: Path, dossier_dir: Path, html_dir: Path, max_workers: int = None, runs_per_test: int = 3) -> None:
+    """Run tests with all configurations in parallel."""
+    # Load the test configuration
+    with config_file.open('r', encoding='utf-8') as f:
+        test_config = json.load(f)
+    
+    # Create CSV header
+    with output_csv.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['chunk_size', 'chunk_overlap', 'event_id', 'k', 'user_id', 'run_number', 'faithfulness_score', 'suggestions'])
+    
+    # Generate all configuration combinations
+    configs = list(generate_config_combinations(test_config.get('configs', {})))
+    logging.info(f"Generated {len(configs)} configuration combinations")
+    
+    # Ensure Chroma DBs exist for all configurations
+    for config in configs:
+        ensure_chroma_db_exists(config, dossier_dir, html_dir)
+    
+    # Process all configs in parallel, with each config handling all users
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                process_users, 
+                config, 
+                test_config.get('test_users', []), 
+                output_csv,
+                max_workers,
+                runs_per_test
+            ) 
+            for config in configs
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Error in config processing: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="Connection RAG CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -377,6 +509,15 @@ def main():
     sug.add_argument("--evaluate", action="store_true", help="Evaluate faithfulness of suggestions")
     sug.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     sug.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
+    
+    # Add the test subcommand
+    test = sub.add_parser("test")
+    test.add_argument("--config", type=Path, required=True, help="Path to JSON config file with test parameters")
+    test.add_argument("--output", type=Path, default=Path("test_results.csv"), help="Path to output CSV file")
+    test.add_argument("--dossier_dir", type=Path, required=True, help="Directory containing participant dossiers")
+    test.add_argument("--html_dir", type=Path, required=True, help="Directory containing HTML research")
+    test.add_argument("--max_workers", type=int, help="Maximum number of worker threads for parallel testing")
+    test.add_argument("--runs_per_test", type=int, default=3, help="Number of times to run each test for each user")
 
     args = parser.parse_args()
 
@@ -401,6 +542,12 @@ def main():
                 print("Suggestions:")
             
             print(json.dumps(user_results['suggestions'], indent=2, ensure_ascii=False))
+    
+    elif args.cmd == "test":
+        start_time = time.time()
+        run_tests(args.config, args.output, args.dossier_dir, args.html_dir, args.max_workers, args.runs_per_test)
+        elapsed = time.time() - start_time
+        logging.info(f"Testing completed in {elapsed:.2f} seconds. Results saved to {args.output}")
 
 
 if __name__ == "__main__":
