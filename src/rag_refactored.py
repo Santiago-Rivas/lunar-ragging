@@ -5,6 +5,7 @@ Requirements already satisfied in requirements.txt: langchain, chromadb, bs4, op
 How to use (quick):
 $ python rag_refactored.py index --dossier_dir data/dossiers --html_dir data/html  # ingest
 $ python rag_refactored.py suggest --user_id lionel_messi --event_id moon_event   # get matches
+$ python rag_refactored.py suggest --user_id lionel_messi --event_id moon_event --evaluate  # get matches with faithfulness evaluation
 """
 
 from __future__ import annotations
@@ -28,14 +29,17 @@ from bs4 import BeautifulSoup
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Chroma
+from datasets import Dataset
+from ragas.metrics import faithfulness
+from ragas import evaluate
 
 # ---------- configuration --------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "paraphrase-MiniLM-L3-v2")
 CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-CHUNK_SIZE = 1024
-CHUNK_OVERLAP = 128
-PERSIST_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
+DEFAULT_CHUNK_SIZE = 1024
+DEFAULT_CHUNK_OVERLAP = 128
+CHROMA_BASE_DIR = os.getenv("CHROMA_BASE_DIR", "./chroma_dbs")
 COLLECTION_NAME = "participants"
 
 load_dotenv()
@@ -87,8 +91,13 @@ class ConvSummaryDoc:
 
 # ---------- RAG core --------------------------------------------------------
 class ConnectionRAG:
-    def __init__(self, persist_directory: str = PERSIST_DIR, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP):
-        self.client = chromadb.PersistentClient(path=persist_directory)
+    def __init__(self, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: int = DEFAULT_CHUNK_OVERLAP, chroma_base_dir: str = CHROMA_BASE_DIR):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.persist_directory = Path(chroma_base_dir) / f"cs{chunk_size}_co{chunk_overlap}"
+        self.persist_directory.mkdir(parents=True, exist_ok=True) # Ensure the directory exists
+
+        self.client = chromadb.PersistentClient(path=str(self.persist_directory))
 
         # Using HuggingFace embeddings instead of OpenAI
         self.embeddings = HuggingFaceEmbeddings(
@@ -102,8 +111,8 @@ class ConnectionRAG:
         self.collection = self._get_collection()
 
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
+            chunk_size=self.chunk_size,  # Use instance attribute
+            chunk_overlap=self.chunk_overlap,  # Use instance attribute
             separators=["\n\n", "\n", " "],
         )
 
@@ -153,41 +162,59 @@ class ConnectionRAG:
             logging.warning("No texts to index!")
 
     # ---- retrieval & suggestion -------------------------------------------
-    def suggest_connections(self, user_id: str, event_id: str, k: int = 5) -> list[dict]:
-        # combine the two predicates under a single $and operator
-        where_filter = {
-            "$and": [
-                {"event_id": {"$eq": event_id}},
-                {"user_id":  {"$ne": user_id}},
-            ]
-        }
+    def suggest_connections(self, user_id: str | list[str], event_id: str, k: int = 5, evaluate_faith: bool = False) -> dict:
+        # Handle both single user_id and list of user_ids
+        user_ids = [user_id] if isinstance(user_id, str) else user_id
+        
+        results = {}
+        
+        for uid in user_ids:
+            # combine the two predicates under a single $and operator
+            where_filter = {
+                "$and": [
+                    {"event_id": {"$eq": event_id}},
+                    {"user_id":  {"$ne": uid}},
+                ]
+            }
 
-        retriever = self.collection.as_retriever(
-            search_type="mmr",
-            search_kwargs={"k": 20, "filter": where_filter},
-        )
-
-        target_user = self._lookup_user(user_id)
-        target_name = ""
-        target_dossier = ""
-        if target_user["metadatas"]:
-            target_name = target_user["metadatas"][0].get("name", "")
-            target_dossier = target_user["metadatas"][0].get("dossier", "")
-        docs = retriever.invoke(target_dossier)
-
-        parts = []
-        for d in docs[:10]:
-            parts.append(
-                {
-                    "user_id": d.metadata["user_id"],
-                    "name":    d.metadata.get("name", ""),
-                    "chunk":   d.page_content.strip(),
-                }
+            retriever = self.collection.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": 20, "filter": where_filter},
             )
 
-        prompt = self._build_prompt(user_id, target_name, target_dossier, parts, k)
-        logging.info("Prompt:\n%s", prompt)
-        return self._ask_llm(prompt)
+            target_user = self._lookup_user(uid)
+            target_name = ""
+            target_dossier = ""
+            if target_user["metadatas"]:
+                target_name = target_user["metadatas"][0].get("name", "")
+                target_dossier = target_user["metadatas"][0].get("dossier", "")
+            docs = retriever.invoke(target_dossier)
+
+            context_items = []
+            for d in docs[:10]:
+                context_items.append(
+                    {
+                        "user_id": d.metadata["user_id"],
+                        "name":    d.metadata.get("name", ""),
+                        "chunk":   d.page_content.strip(),
+                    }
+                )
+
+            prompt = self._build_prompt(uid, target_name, target_dossier, context_items, k)
+            
+            suggestions = self._ask_llm(prompt)
+            
+            result = {"suggestions": suggestions}
+            
+            # If evaluation is requested, add faithfulness score
+            if evaluate_faith:
+                faith_score = self._evaluate_faithfulness(uid, target_name, target_dossier, context_items, suggestions, k)
+                result["faithfulness_score"] = faith_score
+
+            results[uid] = result
+            
+        return results
+        
     def build_prompt(
         self,
         user_id: str,
@@ -197,6 +224,7 @@ class ConnectionRAG:
         k: int,
     ) -> str:
         return self._build_prompt(user_id, user_name, user_dossier, context_items, k)
+        
     # ---- helpers -----------------------------------------------------------
     @staticmethod
     def _build_prompt(
@@ -206,21 +234,19 @@ class ConnectionRAG:
         context_items: list[dict],
         k: int,
     ) -> str:
-        return textwrap.dedent(
-            f"""
-You are an expert networking assistant.
+        prompt = f"""You are an expert networking assistant.
 Given the following context chunks about other participants in the same event, return a JSON list of the top {k} people that should match with user '{user_id}' ({user_name}).
 
 This is the dossier of {user_id}:
 {user_dossier}
 
 Each item must be an object {{"user_id": str, "reason": str}}.
-Only output valid JSON without markdown fences.
+Only output valid JSON without markdown fences."""
 
-Context (JSON):
-{json.dumps(context_items, ensure_ascii=False, indent=2)}
-            """
-        )
+        if context_items:
+            prompt += f"\nContext (JSON):\n{json.dumps(context_items, ensure_ascii=False, indent=2)}"
+
+        return textwrap.dedent(prompt)
 
     def ask_llm(self, prompt: str) -> list[dict]:
         return self._ask_llm(prompt)
@@ -229,7 +255,7 @@ Context (JSON):
         client = openai.OpenAI()
         for attempt in range(2):
             completion = client.chat.completions.create(
-                model=CHAT_MODEL,
+                model=self.CHAT_MODEL,
                 temperature=0.2,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -256,6 +282,35 @@ Context (JSON):
             pass
         return {}
 
+    # ---- evaluation --------------------------------------------------------
+    def _evaluate_faithfulness(self, user_id: str, user_name: str, user_dossier: str, context_items: list[dict], suggestions: list[dict], k: int) -> float:
+        """Evaluate the faithfulness of suggestions using RAGAS."""
+        # Format contexts and answers for RAGAS evaluation
+        contexts = []
+        for item in context_items:
+            contexts.append(item["chunk"])
+
+        answers = ""
+        for suggestion in suggestions:
+            answers += f"{suggestion['reason']}\n"
+
+        prompt = self._build_prompt(user_id, user_name, user_dossier, [], k)
+        questions = [prompt]
+        
+        # Create dataset for RAGAS evaluation
+        eval_data = {
+            'question': questions,
+            'answer': [answers],
+            'contexts': [contexts],
+        }
+        
+        dataset = Dataset.from_dict(eval_data)
+        
+        # Evaluate faithfulness
+        score = evaluate(dataset, metrics=[faithfulness], raise_exceptions=False)
+        
+        return score.to_pandas()["faithfulness"].iloc[0]
+
 
 # ---------- CLI ------------------------------------------------------------
 
@@ -264,7 +319,6 @@ def ingest_from_dirs(rag: ConnectionRAG, dossier_dir: Path, html_dir: Path, even
     name_map = _load_name_map(dossier_dir)
 
     for dossier_file in dossier_dir.glob("*.md"):
-        print("dossier_file: " + str(dossier_file)[:50] + ("..." if len(str(dossier_file)) > 50 else ""))
         user_id = dossier_file.stem
         text = dossier_file.read_text(encoding="utf-8")
         docs.append(
@@ -313,28 +367,40 @@ def main():
     idx.add_argument("--html_dir", type=Path, required=True)
     idx.add_argument("--event_id", type=str, default="moon_event")
     idx.add_argument("--reset_db", action="store_true")
+    idx.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
+    idx.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
 
     sug = sub.add_parser("suggest")
-    sug.add_argument("--user_id", required=True)
+    sug.add_argument("--user_id", nargs="+", required=True, help="One or more user IDs to get suggestions for")
     sug.add_argument("--event_id", default="moon_event")
     sug.add_argument("--k", type=int, default=5)
+    sug.add_argument("--evaluate", action="store_true", help="Evaluate faithfulness of suggestions")
+    sug.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
+    sug.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
 
     args = parser.parse_args()
 
     if args.cmd == "index":
-        if args.reset_db and Path(PERSIST_DIR).exists():
+        db_path = Path(CHROMA_BASE_DIR) / f"cs{args.chunk_size}_co{args.chunk_overlap}"
+        if args.reset_db and db_path.exists():
             import shutil
-
-            shutil.rmtree(PERSIST_DIR)
-            logging.info("Reset Chroma DB at %s", PERSIST_DIR)
-        rag = ConnectionRAG()
+            shutil.rmtree(db_path)
+            logging.info("Reset Chroma DB at %s", db_path)
+        rag = ConnectionRAG(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap)
         ingest_from_dirs(rag, args.dossier_dir, args.html_dir, args.event_id)
         logging.info("Indexing complete.")
 
     elif args.cmd == "suggest":
-        rag = ConnectionRAG()
-        matches = rag.suggest_connections(args.user_id, args.event_id, args.k)
-        print(json.dumps(matches, indent=2, ensure_ascii=False))
+        rag = ConnectionRAG(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap)
+        results = rag.suggest_connections(args.user_id, args.event_id, args.k, args.evaluate)
+        
+        for user_id, user_results in results.items():
+            print(f"\n--- Results for user_id: {user_id} ---")
+            if args.evaluate:
+                print(f"Faithfulness Score: {user_results['faithfulness_score']}")
+                print("Suggestions:")
+            
+            print(json.dumps(user_results['suggestions'], indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
