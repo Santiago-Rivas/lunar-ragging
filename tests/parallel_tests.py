@@ -12,7 +12,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from datasets import Dataset
 import openai
 import shutil
-import hashlib
 import threading
 
 # Add parent directory to path so we can import from src
@@ -20,7 +19,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from ragas import evaluate
 from ragas.metrics import Faithfulness
-from src.rag_refactored import ConnectionRAG, ingest_from_dirs
+from tests.rag_refactored import ConnectionRAG, ingest_from_dirs
 
 DATA_DOSSIER = Path(__file__).parent.parent / "data/space_data/dossiers"
 DATA_HTML    = Path(__file__).parent.parent / "data/space_data/html"

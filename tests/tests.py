@@ -9,7 +9,7 @@ import openai
 
 from ragas import evaluate
 from ragas.metrics import Faithfulness
-from src.rag_refactored import ConnectionRAG, ingest_from_dirs
+from tests.rag_refactored import ConnectionRAG, ingest_from_dirs
 
 DATA_DOSSIER = Path("../data/dossiers")
 DATA_HTML    = Path("../data/html")
