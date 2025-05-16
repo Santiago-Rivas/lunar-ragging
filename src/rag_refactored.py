@@ -24,17 +24,20 @@ import concurrent.futures
 from dotenv import load_dotenv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Protocol, Sequence, Dict, Any, Tuple, Iterator
+from typing import List, Protocol, Sequence, Dict, Any, Tuple, Iterator, Optional
 
 import chromadb
 import openai
 from bs4 import BeautifulSoup
 from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter, TokenTextSplitter
 from langchain.vectorstores import Chroma
 from datasets import Dataset
 from ragas.metrics import faithfulness
 from ragas import evaluate
+from ragas import SingleTurnSample
+from ragas.metrics import AspectCritic
+from langchain_openai import ChatOpenAI  # Use langchain_openai instead
 
 # ---------- configuration --------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -42,6 +45,7 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "paraphrase-MiniLM-L3-v2")
 CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 DEFAULT_CHUNK_SIZE = 1024
 DEFAULT_CHUNK_OVERLAP = 128
+DEFAULT_SPLITTER_TYPE = "recursive_character"  # New default setting
 CHROMA_BASE_DIR = os.getenv("CHROMA_BASE_DIR", "./chroma_dbs")
 COLLECTION_NAME = "participants"
 
@@ -98,10 +102,13 @@ shared_embeddings = HuggingFaceEmbeddings(
 
 # ---------- RAG core --------------------------------------------------------
 class ConnectionRAG:
-    def __init__(self, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: int = DEFAULT_CHUNK_OVERLAP, chroma_base_dir: str = CHROMA_BASE_DIR):
+    def __init__(self, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: int = DEFAULT_CHUNK_OVERLAP, 
+                 chroma_base_dir: str = CHROMA_BASE_DIR, splitter_type: str = DEFAULT_SPLITTER_TYPE):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.persist_directory = Path(chroma_base_dir) / f"cs{chunk_size}_co{chunk_overlap}"
+        self.splitter_type = splitter_type
+        # Include splitter_type in the directory path
+        self.persist_directory = Path(chroma_base_dir) / f"{splitter_type}_cs{chunk_size}_co{chunk_overlap}"
         self.persist_directory.mkdir(parents=True, exist_ok=True) # Ensure the directory exists
 
         self.client = chromadb.PersistentClient(path=str(self.persist_directory))
@@ -114,11 +121,19 @@ class ConnectionRAG:
         # 2️⃣  hand that object to Chroma
         self.collection = self._get_collection()
 
-        self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size,  # Use instance attribute
-            chunk_overlap=self.chunk_overlap,  # Use instance attribute
-            separators=["\n\n", "\n", " "],
-        )
+        # Initialize the appropriate text splitter based on splitter_type
+        if self.splitter_type == "token":
+            self.splitter = TokenTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+                encoding_name="cl100k_base",  # OpenAI's encoding 
+            )
+        else:  # Default to recursive character splitter
+            self.splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.chunk_size,  # Use instance attribute
+                chunk_overlap=self.chunk_overlap,  # Use instance attribute
+                separators=["\n\n", "\n", " "],
+            )
 
     def _get_collection(self) -> Chroma:
         try:
@@ -212,6 +227,7 @@ class ConnectionRAG:
             
             # If evaluation is requested, add faithfulness score
             if evaluate_faith:
+                print("target_name", target_name)
                 faith_score = self._evaluate_faithfulness(uid, target_name, target_dossier, context_items, suggestions, k)
                 result["faithfulness_score"] = faith_score
 
@@ -298,8 +314,17 @@ Only output valid JSON without markdown fences."""
         for suggestion in suggestions:
             answers += f"{suggestion['reason']}\n"
 
-        prompt = self._build_prompt(user_id, user_name, user_dossier, [], k)
+        # prompt = f"What are the top {k} people that should match with user '{user_id}' ({user_name})?"
+
+        prompt = self._build_prompt(user_id, user_name, user_dossier, context_items, k)
         questions = [prompt]
+
+        # print("contexts")
+        # print(contexts)
+        # print("answers")
+        # print(answers)
+        # print("questions")
+        # print(questions)
         
         # Create dataset for RAGAS evaluation
         eval_data = {
@@ -310,8 +335,13 @@ Only output valid JSON without markdown fences."""
         
         dataset = Dataset.from_dict(eval_data)
         
-        # Evaluate faithfulness
-        score = evaluate(dataset, metrics=[faithfulness], raise_exceptions=False)
+        # Initialize LangChain OpenAI chat model with the same model as our chat model
+        # RAGAS 0.2.15 works with LangChain models directly
+        from ragas.llms import LangchainLLMWrapper
+        llm = LangchainLLMWrapper(ChatOpenAI(model=self.CHAT_MODEL, temperature=0))
+        
+        # Evaluate faithfulness with specified LLM
+        score = evaluate(dataset, metrics=[faithfulness], llm=llm, raise_exceptions=True)
         
         return score.to_pandas()["faithfulness"].iloc[0]
 
@@ -377,8 +407,9 @@ def generate_config_combinations(config: Dict[str, Any]) -> Iterator[Dict[str, A
 
 def get_config_hash(config: Dict[str, Any]) -> str:
     """Generate a hash string for a configuration."""
-    # For simplicity, we'll just use chunk_size and chunk_overlap for the directory name
-    return f"cs{config.get('chunk_size', DEFAULT_CHUNK_SIZE)}_co{config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP)}"
+    # Include splitter_type in the hash
+    splitter_type = config.get('splitter_type', DEFAULT_SPLITTER_TYPE)
+    return f"{splitter_type}_cs{config.get('chunk_size', DEFAULT_CHUNK_SIZE)}_co{config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP)}"
 
 def ensure_chroma_db_exists(config: Dict[str, Any], dossier_dir: Path, html_dir: Path) -> None:
     """Check if a Chroma DB for this config exists, if not, create it."""
@@ -389,7 +420,8 @@ def ensure_chroma_db_exists(config: Dict[str, Any], dossier_dir: Path, html_dir:
         logging.info(f"Creating new Chroma DB for config: {config_hash}")
         rag = ConnectionRAG(
             chunk_size=config.get('chunk_size', DEFAULT_CHUNK_SIZE),
-            chunk_overlap=config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP)
+            chunk_overlap=config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP),
+            splitter_type=config.get('splitter_type', DEFAULT_SPLITTER_TYPE)
         )
         ingest_from_dirs(rag, dossier_dir, html_dir, config.get('event_id', 'moon_event'))
     else:
@@ -400,7 +432,8 @@ def process_users(config: Dict[str, Any], user_ids: List[str], output_csv: Path,
     # Initialize ConnectionRAG only once for all users with this config
     rag = ConnectionRAG(
         chunk_size=config.get('chunk_size', DEFAULT_CHUNK_SIZE),
-        chunk_overlap=config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP)
+        chunk_overlap=config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP),
+        splitter_type=config.get('splitter_type', DEFAULT_SPLITTER_TYPE)
     )
     
     k = config.get('k', 5)
@@ -422,6 +455,7 @@ def process_users(config: Dict[str, Any], user_ids: List[str], output_csv: Path,
                 
                 # Form a row: first all config params, then user_id, run number, faith score, and serialized suggestions
                 row = [
+                    config.get('splitter_type', DEFAULT_SPLITTER_TYPE),
                     config.get('chunk_size', DEFAULT_CHUNK_SIZE),
                     config.get('chunk_overlap', DEFAULT_CHUNK_OVERLAP),
                     config.get('event_id', 'moon_event'),
@@ -461,7 +495,7 @@ def run_tests(config_file: Path, output_csv: Path, dossier_dir: Path, html_dir: 
     # Create CSV header
     with output_csv.open('w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['chunk_size', 'chunk_overlap', 'event_id', 'k', 'user_id', 'run_number', 'faithfulness_score', 'suggestions'])
+        writer.writerow(['splitter_type', 'chunk_size', 'chunk_overlap', 'event_id', 'k', 'user_id', 'run_number', 'faithfulness_score', 'suggestions'])
     
     # Generate all configuration combinations
     configs = list(generate_config_combinations(test_config.get('configs', {})))
@@ -501,6 +535,9 @@ def main():
     idx.add_argument("--reset_db", action="store_true")
     idx.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     idx.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
+    idx.add_argument("--splitter_type", type=str, default=DEFAULT_SPLITTER_TYPE, 
+                     choices=["recursive_character", "token"], 
+                     help="Type of text splitter to use")
 
     sug = sub.add_parser("suggest")
     sug.add_argument("--user_id", nargs="+", required=True, help="One or more user IDs to get suggestions for")
@@ -509,6 +546,9 @@ def main():
     sug.add_argument("--evaluate", action="store_true", help="Evaluate faithfulness of suggestions")
     sug.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     sug.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
+    sug.add_argument("--splitter_type", type=str, default=DEFAULT_SPLITTER_TYPE, 
+                     choices=["recursive_character", "token"], 
+                     help="Type of text splitter to use")
     
     # Add the test subcommand
     test = sub.add_parser("test")
@@ -522,17 +562,20 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == "index":
-        db_path = Path(CHROMA_BASE_DIR) / f"cs{args.chunk_size}_co{args.chunk_overlap}"
+        # Update the DB path to include splitter_type
+        db_path = Path(CHROMA_BASE_DIR) / f"{args.splitter_type}_cs{args.chunk_size}_co{args.chunk_overlap}"
         if args.reset_db and db_path.exists():
             import shutil
             shutil.rmtree(db_path)
             logging.info("Reset Chroma DB at %s", db_path)
-        rag = ConnectionRAG(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap)
+        rag = ConnectionRAG(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap, 
+                           splitter_type=args.splitter_type)
         ingest_from_dirs(rag, args.dossier_dir, args.html_dir, args.event_id)
         logging.info("Indexing complete.")
 
     elif args.cmd == "suggest":
-        rag = ConnectionRAG(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap)
+        rag = ConnectionRAG(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap,
+                           splitter_type=args.splitter_type)
         results = rag.suggest_connections(args.user_id, args.event_id, args.k, args.evaluate)
         
         for user_id, user_results in results.items():
