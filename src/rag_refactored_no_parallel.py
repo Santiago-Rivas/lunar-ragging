@@ -342,6 +342,15 @@ def ingest_from_dirs(rag: ConnectionRAG, dossier_dir: Path, html_dir: Path, even
         )
         html_path = html_dir / f"{user_id}.html"
         if html_path.exists():
+            html_doc = HTMLResearchDoc(
+                    user_id=user_id,
+                    event_id=event_id,
+                    html_path=html_path,
+                    name=name_map.get(user_id, ""),
+                )
+            
+            print(f"HTML Research Doc: {html_doc}")
+            
             docs.append(
                 HTMLResearchDoc(
                     user_id=user_id,
