@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Protocol, Sequence, Dict, Any, Tuple, Iterator, Optional
+import numpy as np
 
 import chromadb
 import openai
@@ -33,7 +34,7 @@ from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter, TokenTextSplitter
 from langchain.vectorstores import Chroma
 from datasets import Dataset
-from ragas.metrics import faithfulness
+from ragas.metrics import faithfulness, answer_relevancy
 from ragas import evaluate
 from ragas import SingleTurnSample
 from ragas.metrics import AspectCritic
@@ -225,11 +226,11 @@ class ConnectionRAG:
             
             result = {"suggestions": suggestions}
             
-            # If evaluation is requested, add faithfulness score
+            # If evaluation is requested, add faithfulness and relevancy scores
             if evaluate_faith:
-                print("target_name", target_name)
-                faith_score = self._evaluate_faithfulness(uid, target_name, target_dossier, context_items, suggestions, k)
-                result["faithfulness_score"] = faith_score
+                evaluation_scores = self._evaluate_metrics(uid, target_name, target_dossier, context_items, suggestions, k)
+                result["faithfulness_score"] = evaluation_scores["faithfulness"]
+                result["relevancy_score"] = evaluation_scores["relevancy"]
 
             results[uid] = result
             
@@ -303,47 +304,44 @@ Only output valid JSON without markdown fences."""
         return {}
 
     # ---- evaluation --------------------------------------------------------
-    def _evaluate_faithfulness(self, user_id: str, user_name: str, user_dossier: str, context_items: list[dict], suggestions: list[dict], k: int) -> float:
-        """Evaluate the faithfulness of suggestions using RAGAS."""
-        # Format contexts and answers for RAGAS evaluation
+    def _evaluate_metrics(self, user_id: str, user_name: str, user_dossier: str, context_items: list[dict],
+                         suggestions: list[dict], k: int) -> dict:
+        """Evaluate the faithfulness and relevancy of suggestions using RAGAS."""
+        prompt = self._build_prompt(user_id, user_name, user_dossier, [], k)
+
+        questions = []
+        answers = []
         contexts = []
-        for item in context_items:
-            contexts.append(item["chunk"])
-
-        answers = ""
         for suggestion in suggestions:
-            answers += f"{suggestion['reason']}\n"
+            questions.append(prompt)
+            answers.append(suggestion['reason'])
+            context = [user_dossier]
+            for item in context_items:
+                if item['user_id'] == suggestion['user_id']:
+                    context.append(item['chunk'])
+            contexts.append(context)
 
-        # prompt = f"What are the top {k} people that should match with user '{user_id}' ({user_name})?"
-
-        prompt = self._build_prompt(user_id, user_name, user_dossier, context_items, k)
-        questions = [prompt]
-
-        # print("contexts")
-        # print(contexts)
-        # print("answers")
-        # print(answers)
-        # print("questions")
-        # print(questions)
-        
         # Create dataset for RAGAS evaluation
         eval_data = {
             'question': questions,
-            'answer': [answers],
-            'contexts': [contexts],
+            'answer': answers,
+            'contexts': contexts,
         }
-        
         dataset = Dataset.from_dict(eval_data)
+
+        # Evaluate metrics
+        score = evaluate(dataset, metrics=[faithfulness, answer_relevancy], raise_exceptions=True)
         
-        # Initialize LangChain OpenAI chat model with the same model as our chat model
-        # RAGAS 0.2.15 works with LangChain models directly
-        from ragas.llms import LangchainLLMWrapper
-        llm = LangchainLLMWrapper(ChatOpenAI(model=self.CHAT_MODEL, temperature=0))
-        
-        # Evaluate faithfulness with specified LLM
-        score = evaluate(dataset, metrics=[faithfulness], llm=llm, raise_exceptions=True)
-        
-        return score.to_pandas()["faithfulness"].iloc[0]
+        return {
+            "faithfulness": np.mean(score["faithfulness"]),
+            "relevancy": np.mean(score["answer_relevancy"])
+        }
+
+    def _evaluate_faithfulness(self, user_id: str, user_name: str, user_dossier: str, context_items: list[dict],
+                             suggestions: list[dict], k: int) -> float:
+        """Legacy method for backward compatibility"""
+        scores = self._evaluate_metrics(user_id, user_name, user_dossier, context_items, suggestions, k)
+        return scores["faithfulness"]
 
 
 # ---------- CLI ------------------------------------------------------------
@@ -378,13 +376,13 @@ def ingest_from_dirs(rag: ConnectionRAG, dossier_dir: Path, html_dir: Path, even
 
 def _load_name_map(dossier_dir: Path) -> dict[str, str]:
     """
-    Expects a file  <dossier_dir>/id_to_name.csv  with header  id;name
+    Expects a file  <dossier_dir>/users.csv  with header  id;name
     Returns { "1": "Lionel Messi", "2": "Ada Lovelace", … }.
     """
     csv_path = dossier_dir / "users.csv"
     name_map: dict[str, str] = {}
     if not csv_path.exists():
-        logging.warning("Missing id_to_name.csv - names will be empty")
+        logging.warning("Missing users.csv - names will be empty")
         return name_map
 
     with csv_path.open(newline="", encoding="utf-8") as fh:
@@ -445,7 +443,7 @@ def process_users(config: Dict[str, Any], user_ids: List[str], output_csv: Path,
     def process_single_user(user_id: str, run_number: int) -> None:
         """Inner function to process a single user and write results to CSV."""
         try:
-            # Get suggestions with faithfulness evaluation
+            # Get suggestions with faithfulness and relevancy evaluation
             result = rag.suggest_connections(user_id, event_id, k, evaluate_faith=True)
             user_result = result.get(user_id, {})
             
@@ -453,7 +451,7 @@ def process_users(config: Dict[str, Any], user_ids: List[str], output_csv: Path,
             with output_csv.open('a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 
-                # Form a row: first all config params, then user_id, run number, faith score, and serialized suggestions
+                # Form a row: first all config params, then user_id, run number, faith score, relevancy score, and serialized suggestions
                 row = [
                     config.get('splitter_type', DEFAULT_SPLITTER_TYPE),
                     config.get('chunk_size', DEFAULT_CHUNK_SIZE),
@@ -463,6 +461,7 @@ def process_users(config: Dict[str, Any], user_ids: List[str], output_csv: Path,
                     user_id,
                     run_number,
                     user_result.get('faithfulness_score', 0.0),
+                    user_result.get('relevancy_score', 0.0),
                     json.dumps(user_result.get('suggestions', []), ensure_ascii=False)
                 ]
                 
@@ -495,7 +494,7 @@ def run_tests(config_file: Path, output_csv: Path, dossier_dir: Path, html_dir: 
     # Create CSV header
     with output_csv.open('w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['splitter_type', 'chunk_size', 'chunk_overlap', 'event_id', 'k', 'user_id', 'run_number', 'faithfulness_score', 'suggestions'])
+        writer.writerow(['splitter_type', 'chunk_size', 'chunk_overlap', 'event_id', 'k', 'user_id', 'run_number', 'faithfulness_score', 'relevancy_score', 'suggestions'])
     
     # Generate all configuration combinations
     configs = list(generate_config_combinations(test_config.get('configs', {})))
@@ -582,6 +581,7 @@ def main():
             print(f"\n--- Results for user_id: {user_id} ---")
             if args.evaluate:
                 print(f"Faithfulness Score: {user_results['faithfulness_score']}")
+                print(f"Relevancy Score: {user_results['relevancy_score']}")
                 print("Suggestions:")
             
             print(json.dumps(user_results['suggestions'], indent=2, ensure_ascii=False))

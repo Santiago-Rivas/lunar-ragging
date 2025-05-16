@@ -21,7 +21,7 @@ import csv
 from dotenv import load_dotenv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Protocol, Sequence
+from typing import List, Protocol, Sequence, Optional
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
@@ -44,6 +44,7 @@ DEFAULT_CHUNK_SIZE = 1024
 DEFAULT_CHUNK_OVERLAP = 128
 CHROMA_BASE_DIR = os.getenv("CHROMA_BASE_DIR", "./chroma_dbs")
 COLLECTION_NAME = "participants"
+DEFAULT_METRICS_FILE = "metrics_results.csv"
 
 load_dotenv()
 
@@ -96,11 +97,14 @@ class ConvSummaryDoc:
 # ---------- RAG core --------------------------------------------------------
 class ConnectionRAG:
     def __init__(self, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
-                 chroma_base_dir: str = CHROMA_BASE_DIR):
+                 chroma_base_dir: str = CHROMA_BASE_DIR, metrics_file: Optional[str] = None, 
+                 mmr_lambda: float = 0.5):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.persist_directory = Path(chroma_base_dir) / f"cs{chunk_size}_co{chunk_overlap}"
         self.persist_directory.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
+        self.metrics_file = metrics_file
+        self.mmr_lambda = mmr_lambda
 
         self.client = chromadb.PersistentClient(path=str(self.persist_directory))
 
@@ -120,6 +124,16 @@ class ConnectionRAG:
                 chunk_overlap=self.chunk_overlap,
                 encoding_name="cl100k_base",  # OpenAI's encoding 
             )
+        
+        # Initialize CSV file with headers if specified
+        if self.metrics_file:
+            metrics_path = Path(self.metrics_file)
+            # Create file with headers if it doesn't exist
+            if not metrics_path.exists():
+                with open(metrics_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['chunk_size', 'chunk_overlap', 'event_id', 'user_id', 'k', 'mmr_lambda', 'faithfulness', 'relevancy'])
+                logging.info(f"Created metrics file: {self.metrics_file}")
 
     def _get_collection(self) -> Chroma:
         try:
@@ -187,7 +201,11 @@ class ConnectionRAG:
 
             retriever = self.collection.as_retriever(
                 search_type="mmr",
-                search_kwargs={"k": 20, "filter": where_filter},
+                search_kwargs={
+                    "k": 20, 
+                    "filter": where_filter,
+                    "lambda_mult": self.mmr_lambda
+                },
             )
 
             target_user = self._lookup_user(uid)
@@ -208,6 +226,8 @@ class ConnectionRAG:
                         chunk, 
                         k=20, 
                         filter=where_filter
+                        # Note: similarity_search_with_score doesn't support mmr directly,
+                        # but we're tracking this param for the main retriever
                     )
                     all_docs_with_scores.extend(chunk_docs_with_scores)
                 
@@ -224,11 +244,6 @@ class ConnectionRAG:
                 # Get the top 20 documents, sorted by score
                 best_docs = sorted(user_id_to_best_doc.values(), key=lambda x: x[1])[:20]
                 docs = [doc for doc, _ in best_docs]
-                
-                # Print debug info
-                print(f"Reranked {len(all_docs_with_scores)} docs to {len(docs)} unique users")
-                for doc, score in best_docs[:5]:
-                    print(f"User: {doc.metadata.get('user_id')}, Score: {score:.4f}")
                 
                 # Visualize the embeddings if requested
                 if visualize:
@@ -256,7 +271,7 @@ class ConnectionRAG:
 
             # If evaluation is requested, add faithfulness score
             if evaluate_faith:
-                evaluation_scores = self._evaluate_metrics(uid, target_name, target_dossier, context_items, suggestions, k)
+                evaluation_scores = self._evaluate_metrics(uid, target_name, target_dossier, context_items, suggestions, k, event_id)
                 result["faithfulness_score"] = evaluation_scores["faithfulness"]
                 result["relevancy_score"] = evaluation_scores["relevancy"]
 
@@ -333,13 +348,8 @@ Only output valid JSON without markdown fences."""
 
     # ---- evaluation --------------------------------------------------------
     def _evaluate_metrics(self, user_id: str, user_name: str, user_dossier: str, context_items: list[dict],
-                         suggestions: list[dict], k: int) -> dict:
+                         suggestions: list[dict], k: int, event_id: str = "") -> dict:
         """Evaluate the faithfulness and relevancy of suggestions using RAGAS."""
-        # Format contexts and answers for RAGAS evaluation
-        # contexts = [user_dossier]
-        # for item in context_items:
-        #     contexts.append(item["chunk"])
-
         prompt = self._build_prompt(user_id, user_name, user_dossier, [], k)
 
         questions = []
@@ -366,18 +376,37 @@ Only output valid JSON without markdown fences."""
         # Evaluate metrics
         score = evaluate(dataset, metrics=[faithfulness, answer_relevancy], raise_exceptions=True)
 
-        print(
-        f"\n\n\n EVALUATION METRICS: {score}\n\n",
-        f"\n\n Faithfulness: {np.mean(score['faithfulness'])}\n\n",
-        f"\n\n Relevancy: {np.mean(score['answer_relevancy'])}\n\n",
-        f"\n\nEvaluating metrics for {user_name},{user_dossier}\n\n",
-        f"\n\n Questions: {questions}\n\n",
-        f"\n\n Answers: {answers}\n\n",
-        f"\n\n Contexts: {contexts}\n\n\n")
+        faithfulness_score = np.mean(score["faithfulness"])
+        relevancy_score = np.mean(score["answer_relevancy"])
+        
+        # print(
+        # f"\n\n\n EVALUATION METRICS: {score}\n\n",
+        # f"\n\n Faithfulness: {faithfulness_score}\n\n",
+        # f"\n\n Relevancy: {relevancy_score}\n\n",
+        # f"\n\nEvaluating metrics for {user_name},{user_dossier}\n\n",
+        # f"\n\n Questions: {questions}\n\n",
+        # f"\n\n Answers: {answers}\n\n",
+        # f"\n\n Contexts: {contexts}\n\n\n")
+        
+        # Write metrics to CSV if a file was specified
+        if self.metrics_file:
+            with open(self.metrics_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.chunk_size,
+                    self.chunk_overlap,
+                    event_id,
+                    user_id,
+                    k,
+                    self.mmr_lambda,
+                    faithfulness_score,
+                    relevancy_score
+                ])
+                logging.info(f"Saved metrics for user {user_id} to {self.metrics_file}")
         
         return {
-            "faithfulness": np.mean(score["faithfulness"]),
-            "relevancy": np.mean(score["answer_relevancy"])
+            "faithfulness": faithfulness_score,
+            "relevancy": relevancy_score
         }
 
     def _evaluate_faithfulness(self, user_id: str, user_name: str, user_dossier: str, context_items: list[dict],
@@ -611,7 +640,9 @@ def main():
     sug.add_argument("--evaluate", action="store_true", help="Evaluate faithfulness of suggestions")
     sug.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     sug.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
+    sug.add_argument("--mmr_lambda", type=float, default=0.5, help="Lambda multiplier for MMR (0-1, higher values prioritize relevance over diversity)")
     sug.add_argument("--visualize", action="store_true", help="Visualize embeddings")
+    sug.add_argument("--metrics_file", type=str, default=DEFAULT_METRICS_FILE, help="CSV file to save metrics")
 
     args = parser.parse_args()
 
@@ -626,17 +657,26 @@ def main():
         logging.info("Indexing complete.")
 
     elif args.cmd == "suggest":
-        rag = ConnectionRAG(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap)
+        metrics_file = args.metrics_file if args.evaluate else None
+        rag = ConnectionRAG(
+            chunk_size=args.chunk_size, 
+            chunk_overlap=args.chunk_overlap,
+            metrics_file=metrics_file,
+            mmr_lambda=args.mmr_lambda
+        )
         results = rag.suggest_connections(args.user_id, args.event_id, args.k, args.evaluate, args.visualize)
 
-        for user_id, user_results in results.items():
-            print(f"\n--- Results for user_id: {user_id} ---")
-            if args.evaluate:
-                print(f"Faithfulness Score: {user_results['faithfulness_score']}")
-                print(f"Relevancy Score: {user_results['relevancy_score']}")
-                print("Suggestions:")
+        # for user_id, user_results in results.items():
+        #     print(f"\n--- Results for user_id: {user_id} ---")
+        #     if args.evaluate:
+        #         print(f"Faithfulness Score: {user_results['faithfulness_score']}")
+        #         print(f"Relevancy Score: {user_results['relevancy_score']}")
+        #         print("Suggestions:")
 
-            print(json.dumps(user_results['suggestions'], indent=2, ensure_ascii=False))
+        #     print(json.dumps(user_results['suggestions'], indent=2, ensure_ascii=False))
+            
+        if args.evaluate:
+            logging.info(f"Metrics saved to {args.metrics_file}")
 
 if __name__ == "__main__":
     main()
