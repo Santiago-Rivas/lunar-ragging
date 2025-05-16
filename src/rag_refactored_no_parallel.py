@@ -22,15 +22,18 @@ from dotenv import load_dotenv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Protocol, Sequence
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 import chromadb
 import openai
 from bs4 import BeautifulSoup
 from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import TokenTextSplitter
 from langchain.vectorstores import Chroma
 from datasets import Dataset
-from ragas.metrics import faithfulness
+from ragas.metrics import faithfulness, answer_relevancy
 from ragas import evaluate
 
 # ---------- configuration --------------------------------------------------
@@ -112,11 +115,11 @@ class ConnectionRAG:
         # 2️⃣  hand that object to Chroma
         self.collection = self._get_collection()
 
-        self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size,  # Use instance attribute
-            chunk_overlap=self.chunk_overlap,  # Use instance attribute
-            separators=["\n\n", "\n", " "],
-        )
+        self.splitter = TokenTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+                encoding_name="cl100k_base",  # OpenAI's encoding 
+            )
 
     def _get_collection(self) -> Chroma:
         try:
@@ -140,7 +143,9 @@ class ConnectionRAG:
         metas: list[dict] = []
 
         for doc in docs:
-            for chunk in self.splitter.split_text(doc.text):
+            # Remove CONFIDENTIAL DOSSIER header and anything until newline
+            short_text = re.sub(r'CONFIDENTIAL DOSSIER.*?\n', '', doc.text)
+            for chunk in self.splitter.split_text(short_text):
                 ids.append(str(uuid.uuid4()))
                 texts.append(chunk)
                 metas.append(
@@ -158,14 +163,14 @@ class ConnectionRAG:
             logging.info(
                 "Added %d chunks (docs=%d) to collection",
                 len(texts),
-                len({m['user_id'] for m in metas}),
+                len(docs),
             )
         else:
             logging.warning("No texts to index!")
 
     # ---- retrieval & suggestion -------------------------------------------
     def suggest_connections(self, user_id: str | list[str], event_id: str, k: int = 5,
-                            evaluate_faith: bool = False) -> dict:
+                            evaluate_faith: bool = False, visualize: bool = False) -> dict:
         # Handle both single user_id and list of user_ids
         user_ids = [user_id] if isinstance(user_id, str) else user_id
 
@@ -191,7 +196,47 @@ class ConnectionRAG:
             if target_user["metadatas"]:
                 target_name = target_user["metadatas"][0].get("name", "")
                 target_dossier = target_user["metadatas"][0].get("dossier", "")
-            docs = retriever.invoke(target_dossier)
+            
+            # Chunk the target dossier and retrieve for each chunk
+            if target_dossier:
+                chunks = self.splitter.split_text(target_dossier)
+                all_docs_with_scores = []
+                
+                for chunk in chunks:
+                    # Use similarity_search_with_score instead of retriever.invoke to get scores
+                    chunk_docs_with_scores = self.collection.similarity_search_with_score(
+                        chunk, 
+                        k=20, 
+                        filter=where_filter
+                    )
+                    all_docs_with_scores.extend(chunk_docs_with_scores)
+                
+                # Sort all documents by score (lower is better)
+                all_docs_with_scores.sort(key=lambda x: x[1])
+                
+                # Deduplicate by user_id, keeping highest scoring (lowest value) for each
+                user_id_to_best_doc = {}
+                for doc, score in all_docs_with_scores:
+                    user_id = doc.metadata.get("user_id")
+                    if user_id not in user_id_to_best_doc or score < user_id_to_best_doc[user_id][1]:
+                        user_id_to_best_doc[user_id] = (doc, score)
+                
+                # Get the top 20 documents, sorted by score
+                best_docs = sorted(user_id_to_best_doc.values(), key=lambda x: x[1])[:20]
+                docs = [doc for doc, _ in best_docs]
+                
+                # Print debug info
+                print(f"Reranked {len(all_docs_with_scores)} docs to {len(docs)} unique users")
+                for doc, score in best_docs[:5]:
+                    print(f"User: {doc.metadata.get('user_id')}, Score: {score:.4f}")
+                
+                # Visualize the embeddings if requested
+                if visualize:
+                    target_embedding = self.embeddings.embed_query(target_dossier)
+                    self.visualize_embeddings(all_docs_with_scores, best_docs, uid, target_embedding)
+            else:
+                # Fallback to using the whole dossier if it's empty
+                docs = retriever.invoke(target_dossier)
 
             context_items = []
             for d in docs[:10]:
@@ -211,9 +256,9 @@ class ConnectionRAG:
 
             # If evaluation is requested, add faithfulness score
             if evaluate_faith:
-                faith_score = self._evaluate_faithfulness(uid, target_name, target_dossier, context_items, suggestions,
-                                                          k)
-                result["faithfulness_score"] = faith_score
+                evaluation_scores = self._evaluate_metrics(uid, target_name, target_dossier, context_items, suggestions, k)
+                result["faithfulness_score"] = evaluation_scores["faithfulness"]
+                result["relevancy_score"] = evaluation_scores["relevancy"]
 
             results[uid] = result
 
@@ -287,40 +332,210 @@ Only output valid JSON without markdown fences."""
         return {}
 
     # ---- evaluation --------------------------------------------------------
-    def _evaluate_faithfulness(self, user_id: str, user_name: str, user_dossier: str, context_items: list[dict],
-                               suggestions: list[dict], k: int) -> float:
-        """Evaluate the faithfulness of suggestions using RAGAS."""
+    def _evaluate_metrics(self, user_id: str, user_name: str, user_dossier: str, context_items: list[dict],
+                         suggestions: list[dict], k: int) -> dict:
+        """Evaluate the faithfulness and relevancy of suggestions using RAGAS."""
         # Format contexts and answers for RAGAS evaluation
-        contexts = [user_dossier]
-        for item in context_items:
-            contexts.append(item["chunk"])
-
-        answers = ""
-        for suggestion in suggestions:
-            answers += f"{suggestion['reason']}.\n"
+        # contexts = [user_dossier]
+        # for item in context_items:
+        #     contexts.append(item["chunk"])
 
         prompt = self._build_prompt(user_id, user_name, user_dossier, [], k)
-        questions = [prompt]
+
+        questions = []
+        answers = []
+        contexts = []
+        for suggestion in suggestions:
+            questions.append(prompt)
+            answers.append(suggestion['reason'])
+            suggestion['user_id'] = user_id
+            context = [user_dossier]
+            for item in context_items:
+                if item['user_id'] == suggestion['user_id']:
+                    context.append(item['chunk'])
+            contexts.append(context)
 
         # Create dataset for RAGAS evaluation
         eval_data = {
             'question': questions,
-            'answer': [answers],
-            'contexts': [contexts],
-
+            'answer': answers,
+            'contexts': contexts,
         }
         dataset = Dataset.from_dict(eval_data)
 
-        # Evaluate faithfulness
-        score = evaluate(dataset, metrics=[faithfulness], raise_exceptions=True)
+        # Evaluate metrics
+        score = evaluate(dataset, metrics=[faithfulness, answer_relevancy], raise_exceptions=True)
 
         print(
-        f"\n\n\n FAITHFULNESS: {score}\n\n",
-        f"\n\nEvaluating faithfulness of {user_name},{user_dossier}\n\n",
+        f"\n\n\n EVALUATION METRICS: {score}\n\n",
+        f"\n\n Faithfulness: {np.mean(score['faithfulness'])}\n\n",
+        f"\n\n Relevancy: {np.mean(score['answer_relevancy'])}\n\n",
+        f"\n\nEvaluating metrics for {user_name},{user_dossier}\n\n",
         f"\n\n Questions: {questions}\n\n",
         f"\n\n Answers: {answers}\n\n",
         f"\n\n Contexts: {contexts}\n\n\n")
-        return score.to_pandas()["faithfulness"].iloc[0]
+        
+        return {
+            "faithfulness": np.mean(score["faithfulness"]),
+            "relevancy": np.mean(score["answer_relevancy"])
+        }
+
+    def _evaluate_faithfulness(self, user_id: str, user_name: str, user_dossier: str, context_items: list[dict],
+                             suggestions: list[dict], k: int) -> float:
+        """Legacy method for backward compatibility"""
+        scores = self._evaluate_metrics(user_id, user_name, user_dossier, context_items, suggestions, k)
+        return scores["faithfulness"]
+        
+    def visualize_embeddings(self, all_docs_with_scores, best_docs, user_id, target_embedding=None):
+        """
+        Visualize document embeddings before and after reranking using t-SNE.
+        
+        Args:
+            all_docs_with_scores: List of (doc, score) tuples before deduplication
+            best_docs: List of (doc, score) tuples after deduplication and reranking
+            user_id: User ID being analyzed
+            target_embedding: Optional embedding of the target document
+        """
+        # Create output directory
+        output_dir = Path("visualization_output")
+        output_dir.mkdir(exist_ok=True)
+        
+        # 1. Extract embeddings and prepare data
+        all_embeddings = []
+        all_labels = []
+        all_scores = []
+        best_indices = []
+        
+        for i, (doc, score) in enumerate(all_docs_with_scores):
+            # Get embedding from document
+            embedding = self.embeddings.embed_query(doc.page_content)
+            all_embeddings.append(embedding)
+            all_labels.append(doc.metadata.get("user_id", "unknown"))
+            all_scores.append(score)
+            
+            # Check if this document is in best_docs
+            for best_doc, _ in best_docs:
+                if doc.page_content == best_doc.page_content:
+                    best_indices.append(i)
+                    break
+        
+        # Add target embedding if provided
+        if target_embedding is not None:
+            all_embeddings.append(target_embedding)
+            all_labels.append(f"{user_id} (target)")
+            all_scores.append(0)  # Placeholder score for target
+            target_idx = len(all_embeddings) - 1
+        
+        # Convert to numpy array
+        embeddings_array = np.array(all_embeddings)
+        
+        # 2. Apply t-SNE for dimensionality reduction
+        tsne = TSNE(n_components=2, random_state=42)
+        embeddings_2d = tsne.fit_transform(embeddings_array)
+        
+        # 3. Create t-SNE plot showing before and after reranking
+        plt.figure(figsize=(12, 10))
+        
+        # Plot all documents
+        plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], c='lightgray', alpha=0.5, label='All retrieved chunks')
+        
+        # Highlight best documents
+        plt.scatter(embeddings_2d[best_indices, 0], embeddings_2d[best_indices, 1], 
+                    c='blue', alpha=0.8, s=100, label='Reranked/deduplicated chunks')
+        
+        # Highlight target document if provided
+        if target_embedding is not None:
+            plt.scatter(embeddings_2d[target_idx, 0], embeddings_2d[target_idx, 1], 
+                       c='red', s=200, marker='*', label='Target user')
+        
+        # Add labels for all best documents (not just top 5)
+        for i in best_indices:
+            plt.annotate(all_labels[i], (embeddings_2d[i, 0], embeddings_2d[i, 1]),
+                        xytext=(5, 5), textcoords='offset points', fontsize=8)
+        
+        plt.title(f'Embeddings visualization for user {user_id}')
+        plt.legend()
+        plt.tight_layout()
+        
+        # Save the t-SNE plot
+        plt.savefig(output_dir / f"embeddings_tsne_{user_id}.png")
+        plt.close()
+        
+        # 4. Create score distribution plot
+        plt.figure(figsize=(10, 6))
+        
+        # All scores
+        all_scores_array = np.array(all_scores)
+        # Remove the target score which is a placeholder
+        if target_embedding is not None:
+            all_scores_array = all_scores_array[:-1]
+        
+        # Get scores for best docs
+        best_scores = [all_scores_array[i] for i in best_indices]
+        
+        # Plot histograms
+        plt.hist(all_scores_array, bins=20, alpha=0.5, label='All chunks', color='lightgray')
+        plt.hist(best_scores, bins=20, alpha=0.7, label='Selected chunks', color='blue')
+        
+        plt.axvline(np.mean(all_scores_array), color='gray', linestyle='dashed', linewidth=1, label=f'Mean all: {np.mean(all_scores_array):.3f}')
+        plt.axvline(np.mean(best_scores), color='blue', linestyle='dashed', linewidth=1, label=f'Mean selected: {np.mean(best_scores):.3f}')
+        
+        plt.title(f'Score Distribution Before/After Reranking for User {user_id}')
+        plt.xlabel('Similarity Score (lower is better)')
+        plt.ylabel('Count')
+        plt.legend()
+        plt.tight_layout()
+        
+        # Save the score distribution plot
+        plt.savefig(output_dir / f"score_distribution_{user_id}.png")
+        plt.close()
+        
+        # 5. Create a plot showing user representation before/after reranking
+        plt.figure(figsize=(12, 6))
+        
+        # Count occurrences of each user_id before reranking
+        user_counts_before = {}
+        for label in all_labels:
+            if label == f"{user_id} (target)":  # Skip target user
+                continue
+            user_counts_before[label] = user_counts_before.get(label, 0) + 1
+        
+        # Count occurrences of each user_id after reranking
+        user_counts_after = {}
+        for i in best_indices:
+            label = all_labels[i]
+            user_counts_after[label] = user_counts_after.get(label, 0) + 1
+        
+        # Get top 10 users by count before reranking
+        top_users = sorted(user_counts_before.items(), key=lambda x: x[1], reverse=True)[:10]
+        top_user_ids = [u for u, _ in top_users]
+        
+        # Prepare data for bar chart
+        user_counts_before_top = [user_counts_before.get(uid, 0) for uid in top_user_ids]
+        user_counts_after_top = [user_counts_after.get(uid, 0) for uid in top_user_ids]
+        
+        # Create a grouped bar chart
+        x = np.arange(len(top_user_ids))
+        width = 0.35
+        
+        plt.bar(x - width/2, user_counts_before_top, width, label='Before reranking', color='lightgray')
+        plt.bar(x + width/2, user_counts_after_top, width, label='After reranking', color='blue')
+        
+        plt.xlabel('User ID')
+        plt.ylabel('Number of chunks')
+        plt.title(f'Number of chunks per user before/after reranking for User {user_id}')
+        plt.xticks(x, top_user_ids, rotation=45, ha='right')
+        plt.legend()
+        plt.tight_layout()
+        
+        # Save the user representation plot
+        plt.savefig(output_dir / f"user_representation_{user_id}.png")
+        plt.close()
+        
+        logging.info(f"Visualizations saved to visualization_output/ directory for user {user_id}")
+        logging.info(f"- t-SNE plot: embeddings_tsne_{user_id}.png")
+        logging.info(f"- Score distribution: score_distribution_{user_id}.png") 
+        logging.info(f"- User representation: user_representation_{user_id}.png")
 
 
 # ---------- CLI ------------------------------------------------------------
@@ -348,8 +563,6 @@ def ingest_from_dirs(rag: ConnectionRAG, dossier_dir: Path, html_dir: Path, even
                     html_path=html_path,
                     name=name_map.get(user_id, ""),
                 )
-            
-            print(f"HTML Research Doc: {html_doc}")
             
             docs.append(
                 HTMLResearchDoc(
@@ -398,6 +611,7 @@ def main():
     sug.add_argument("--evaluate", action="store_true", help="Evaluate faithfulness of suggestions")
     sug.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     sug.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
+    sug.add_argument("--visualize", action="store_true", help="Visualize embeddings")
 
     args = parser.parse_args()
 
@@ -413,12 +627,13 @@ def main():
 
     elif args.cmd == "suggest":
         rag = ConnectionRAG(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap)
-        results = rag.suggest_connections(args.user_id, args.event_id, args.k, args.evaluate)
+        results = rag.suggest_connections(args.user_id, args.event_id, args.k, args.evaluate, args.visualize)
 
         for user_id, user_results in results.items():
             print(f"\n--- Results for user_id: {user_id} ---")
             if args.evaluate:
                 print(f"Faithfulness Score: {user_results['faithfulness_score']}")
+                print(f"Relevancy Score: {user_results['relevancy_score']}")
                 print("Suggestions:")
 
             print(json.dumps(user_results['suggestions'], indent=2, ensure_ascii=False))
